@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
-import ccxt
-import requests
+import os
 from datetime import datetime, timedelta, date
 import backtrader as bt
 import importlib.util
@@ -412,75 +411,6 @@ class CombinedStrategy(bt.Strategy):
 
 st.set_page_config(page_title="Crypto Multi-Backtester", layout="wide")
 
-# --- 1. Fetch Top 30 Coins by Market Cap (CoinGecko) ---
-@st.cache_data(show_spinner=True)
-def get_top_30_usdt_pairs():
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "market_cap_desc",
-        "per_page": 30,
-        "page": 1,
-        "sparkline": False
-    }
-    response = requests.get(url, params=params)
-    coins = response.json()
-    # Format as Binance symbols (e.g., BTCUSDT)
-    symbols = []
-    for coin in coins:
-        symbol = coin['symbol'].upper() + 'USDT'
-        symbols.append(symbol)
-    return symbols
-
-# --- 1b. Get valid Binance USDT pairs from top 30 ---
-@st.cache_data(show_spinner=True)
-def get_valid_binance_usdt_pairs(top_30_symbols):
-    exchange = ccxt.binance()
-    binance_markets = exchange.load_markets()
-    valid_usdt_pairs = [s for s in top_30_symbols if s.replace('USDT', '/USDT') in binance_markets]
-    return valid_usdt_pairs
-
-# --- 2. Fetch 4h OHLCV Data from Binance via CCXT, with caching ---
-@st.cache_data(show_spinner=True)
-def fetch_ohlcv(symbol, start_date, end_date):
-    try:
-        exchange = ccxt.binance()
-        timeframe = '4h'
-        # Ensure start_date and end_date are datetime.datetime objects
-        if isinstance(start_date, date) and not isinstance(start_date, datetime):
-            start_date = datetime.combine(start_date, datetime.min.time())
-        if isinstance(end_date, date) and not isinstance(end_date, datetime):
-            end_date = datetime.combine(end_date, datetime.min.time())
-        since = int(start_date.timestamp() * 1000)
-        end_ts = int(end_date.timestamp() * 1000)
-        all_bars = []
-        limit = 1000
-        market_symbol = symbol.replace('USDT', '/USDT')
-        while since < end_ts:
-            try:
-                bars = exchange.fetch_ohlcv(market_symbol, timeframe, since=since, limit=limit)
-            except Exception as e:
-                return pd.DataFrame(columns=pd.Index(["timestamp", "open", "high", "low", "close", "volume", "datetime"]))
-            if not bars:
-                break
-            all_bars += bars
-            last_ts = bars[-1][0]
-            # Binance returns open time, so add 4h to avoid duplicate
-            since = last_ts + 4 * 60 * 60 * 1000
-            if len(bars) < limit:
-                break
-        if all_bars:
-            df = pd.DataFrame(all_bars, columns=pd.Index(["timestamp", "open", "high", "low", "close", "volume"]))
-            df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
-            df = df[(df["datetime"] >= pd.Timestamp(start_date)) & (df["datetime"] <= pd.Timestamp(end_date))]
-        else:
-            df = pd.DataFrame(columns=pd.Index(["timestamp", "open", "high", "low", "close", "volume", "datetime"]))
-        return df
-    except Exception as e:
-        return pd.DataFrame(columns=pd.Index(["timestamp", "open", "high", "low", "close", "volume", "datetime"]))
-    # Final fallback to ensure DataFrame is always returned
-    return pd.DataFrame(columns=pd.Index(["timestamp", "open", "high", "low", "close", "volume", "datetime"]))
-
 # --- 3. Backtest Logic ---
 def run_backtest(df, obLevel1, obLevel2, osLevel1, osLevel2, adx_threshold, use_wavetrend, use_adx):
     try:
@@ -518,7 +448,7 @@ def run_backtest(df, obLevel1, obLevel2, osLevel1, osLevel2, adx_threshold, use_
         raise
 
 # --- 4. Streamlit UI ---
-st.title("Crypto Multi-Backtester (Top 30 by Market Cap)")
+st.title("Crypto Multi-Backtester (Top 200 by Market Cap, Local Data)")
 
 # Diagnostic info for debugging PandasData linter error
 st.write(f'Backtrader version: {bt.__version__}')
@@ -546,21 +476,35 @@ osLevel2 = st.sidebar.number_input("WaveTrend Oversold Level 2", value=20)
 # --- ADX/DI parameters ---
 adx_threshold = st.sidebar.number_input("ADX Threshold", value=20)
 
-top_30_symbols = get_top_30_usdt_pairs()
-valid_usdt_pairs = get_valid_binance_usdt_pairs(top_30_symbols)
+# --- List available coins from local data folder ---
+data_dir = "data"
+if not os.path.exists(data_dir):
+    st.error(f"Data folder '{data_dir}' not found. Please upload OHLCV CSVs.")
+    st.stop()
+csv_files = [f for f in os.listdir(data_dir) if f.endswith("_4h.csv")]
+coin_options = [f.replace("_4h.csv", "") for f in csv_files]
+
 selected_symbols = st.sidebar.multiselect(
-    "Select coins (USDT pairs)", options=valid_usdt_pairs, default=valid_usdt_pairs
+    "Select coins (USDT pairs)", options=coin_options, default=coin_options[:10]
 )
 
-if st.sidebar.button("Fetch Data & Run Backtest"):
-    st.info("Fetching data and running backtest. This may take a few minutes...")
+def load_ohlcv(symbol):
+    csv_path = os.path.join(data_dir, f"{symbol}_4h.csv")
+    df = pd.read_csv(csv_path)
+    # Filter by date range
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    mask = (df["datetime"] >= pd.Timestamp(start_date)) & (df["datetime"] <= pd.Timestamp(end_date))
+    return df.loc[mask].copy()
+
+if st.sidebar.button("Run Backtest"):
+    st.info("Running backtest. This may take a few minutes...")
     results = []
     trade_details = {}
     all_trades = []
     total_final_capital = 0
     for symbol in selected_symbols:
         try:
-            df = fetch_ohlcv(symbol, start_date, end_date)
+            df = load_ohlcv(symbol)
             if not isinstance(df, pd.DataFrame) or df.empty:
                 result = {
                     'symbol': symbol,
@@ -569,7 +513,7 @@ if st.sidebar.button("Fetch Data & Run Backtest"):
                     'end': None,
                     'final_value': None,
                     'num_trades': 0,
-                    'note': 'No data or not available on Binance'
+                    'note': 'No data in CSV'
                 }
                 trade_details[symbol] = []
             else:
@@ -590,7 +534,6 @@ if st.sidebar.button("Fetch Data & Run Backtest"):
             results.append(result)
         except Exception as e:
             st.error(f"Exception for {symbol}: {e}")
-            st.write(df if 'df' in locals() else 'No df variable')
             results.append({'symbol': symbol, 'bars': 0, 'start': None, 'end': None, 'final_value': None, 'num_trades': 0, 'note': f'Error: {e}'} )
             trade_details[symbol] = []
     results_df = pd.DataFrame(results)
@@ -654,7 +597,7 @@ if st.sidebar.button("Fetch Data & Run Backtest"):
                 st.markdown(f"**Success percentage:** {success_pct:.2f}%")
                 st.markdown(f"**Total P&L:** {total_pnl:.2f}")
                 # Plot price with entry/exit markers
-                df = fetch_ohlcv(symbol, start_date, end_date)
+                df = load_ohlcv(symbol)
                 fig, ax = plt.subplots(figsize=(10, 4))
                 ax.plot(df['datetime'], df['close'], label='Close Price', color='blue')
                 # Entry/exit markers
@@ -678,4 +621,4 @@ if st.sidebar.button("Fetch Data & Run Backtest"):
             else:
                 st.write("No trades.")
 else:
-    st.write("Select your settings and click 'Fetch Data & Run Backtest' to begin.") 
+    st.write("Select your settings and click 'Run Backtest' to begin.") 
