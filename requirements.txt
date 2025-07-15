@@ -1,0 +1,6 @@
+streamlit
+backtrader
+ccxt
+pandas
+matplotlib
+requests 
